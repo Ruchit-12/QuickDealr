@@ -1,0 +1,1098 @@
+# -*- coding: utf-8 -*-
+"""
+models.py - Shared database access layer
+Both admin_app and user_app import from here.
+Single source of truth for all DB operations.
+"""
+
+import os
+import sqlite3
+import secrets
+from datetime import datetime, timedelta
+from flask import g
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH  = os.path.join(BASE_DIR, 'database', 'quickdealr.db')
+SCHEMA   = os.path.join(BASE_DIR, 'database', 'schema.sql')
+
+#  Connection 
+
+def get_db():
+    """Get a per-request DB connection stored in Flask's g object."""
+    if 'db' not in g:
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+        g.db.execute("PRAGMA journal_mode = WAL")
+    return g.db
+
+
+def close_db(e=None):
+    db = g.pop('db', None)
+    if db:
+        db.close()
+
+
+def get_raw_conn():
+    """Get a plain connection outside of request context (e.g., SocketIO handlers)."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    return conn
+
+
+def init_db():
+    """Create all tables from schema and seed admin account."""
+    from werkzeug.security import generate_password_hash
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    with open(SCHEMA, encoding='utf-8') as f:
+        conn.executescript(f.read())
+
+    #  Migrations: safe ALTER TABLE for missing columns 
+    def _migrate(table, col, definition):
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if col not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
+            conn.commit()
+            print(f"[DB] Migrated: {table}.{col}")
+
+    _migrate('products', 'status', "TEXT NOT NULL DEFAULT 'pending'")
+    conn.execute("UPDATE products SET status='approved' WHERE approved=1 AND status='pending'")
+    conn.commit()
+
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO users (username,password,role,email,wallet) VALUES (?,?,?,?,?)",
+            ('admin', generate_password_hash('admin123'), 'admin', 'admin@quickdealr.com', 0.0))
+    except Exception:
+        pass
+    conn.commit()
+    conn.close()
+    print("[DB] Initialized:", DB_PATH)
+
+
+#  Users 
+
+def get_user_by_id(uid):
+    return get_db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+
+
+def get_user_by_username(username):
+    return get_db().execute(
+        "SELECT * FROM users WHERE username=? AND is_active=1", (username,)).fetchone()
+
+
+def get_all_users():
+    db = get_db()
+    # Ensure is_whitelisted column exists (safe migration)
+    try:
+        db.execute("SELECT is_whitelisted FROM users LIMIT 1")
+    except Exception:
+        db.execute("ALTER TABLE users ADD COLUMN is_whitelisted INTEGER NOT NULL DEFAULT 0")
+        db.commit()
+    return db.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
+
+
+def create_user(username, password_hash, email, role, wallet=0.0):
+    db = get_db()
+    db.execute(
+        "INSERT INTO users (username,password,email,role,wallet) VALUES (?,?,?,?,?)",
+        (username, password_hash, email, role, wallet))
+    db.commit()
+
+
+def toggle_user_active(uid):
+    db = get_db()
+    user = db.execute("SELECT is_active FROM users WHERE id=?", (uid,)).fetchone()
+    if user:
+        new_state = 0 if user['is_active'] else 1
+        db.execute("UPDATE users SET is_active=? WHERE id=?", (new_state, uid))
+        db.commit()
+        return new_state
+    return None
+
+
+def toggle_user_whitelist(uid):
+    """Toggle is_whitelisted for a user. Creates the column if it doesn't exist yet."""
+    db = get_db()
+    # Ensure column exists (migration-safe)
+    try:
+        db.execute("SELECT is_whitelisted FROM users LIMIT 1")
+    except Exception:
+        db.execute("ALTER TABLE users ADD COLUMN is_whitelisted INTEGER NOT NULL DEFAULT 0")
+        db.commit()
+    user = db.execute("SELECT is_whitelisted FROM users WHERE id=?", (uid,)).fetchone()
+    if user is None:
+        return None
+    new_state = 0 if user['is_whitelisted'] else 1
+    db.execute("UPDATE users SET is_whitelisted=? WHERE id=?", (new_state, uid))
+    db.commit()
+    return new_state
+
+
+def store_uploaded_file(user_id, original_name, file_path, size_bytes):
+    """Store metadata for an uploaded file."""
+    db = get_db()
+    try:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS uploaded_files ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "user_id INTEGER NOT NULL,"
+            "original_name TEXT NOT NULL,"
+            "file_path TEXT NOT NULL,"
+            "size_bytes INTEGER DEFAULT 0,"
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        db.execute(
+            "INSERT INTO uploaded_files (user_id, original_name, file_path, size_bytes) VALUES (?,?,?,?)",
+            (user_id, original_name, file_path, size_bytes)
+        )
+        db.commit()
+    except Exception:
+        pass
+
+
+#  Sessions 
+
+def create_session_token(user_id, ip_address):
+    token   = secrets.token_hex(32)
+    expires = (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+    db = get_db()
+    db.execute("UPDATE sessions SET is_valid=0 WHERE user_id=?", (user_id,))
+    db.execute(
+        "INSERT INTO sessions (user_id,token,ip_address,expires_at) VALUES (?,?,?,?)",
+        (user_id, token, ip_address, expires))
+    db.execute("UPDATE users SET session_token=? WHERE id=?", (token, user_id))
+    db.commit()
+    return token
+
+
+def invalidate_session(user_id, token):
+    db = get_db()
+    db.execute("UPDATE sessions SET is_valid=0 WHERE user_id=? AND token=?", (user_id, token))
+    db.execute("UPDATE users SET session_token=NULL WHERE id=?", (user_id,))
+    db.commit()
+
+
+def valid_session(user_id, token):
+    if not token:
+        return False
+    row = get_db().execute(
+        "SELECT id FROM sessions WHERE user_id=? AND token=? AND is_valid=1 "
+        "AND expires_at > CURRENT_TIMESTAMP", (user_id, token)).fetchone()
+    return row is not None
+
+
+#  Wallet 
+
+def get_wallet(user_id):
+    row = get_db().execute("SELECT wallet FROM users WHERE id=?", (user_id,)).fetchone()
+    return float(row['wallet']) if row else 0.0
+
+
+def credit_wallet(user_id, amount, description='', method='system'):
+    db = get_db()
+    db.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (amount, user_id))
+    db.execute(
+        "INSERT INTO wallet_transactions (user_id,amount,type,method,status,description) "
+        "VALUES (?,?,?,?,?,?)",
+        (user_id, amount, 'credit', method, 'success', description))
+    db.commit()
+
+
+def deduct_wallet(user_id, amount, description='', method='system'):
+    db = get_db()
+    db.execute("UPDATE users SET wallet=wallet-? WHERE id=?", (amount, user_id))
+    db.execute(
+        "INSERT INTO wallet_transactions (user_id,amount,type,method,status,description) "
+        "VALUES (?,?,?,?,?,?)",
+        (user_id, amount, 'debit', method, 'success', description))
+    db.commit()
+
+
+def get_wallet_transactions(user_id, limit=30):
+    return get_db().execute(
+        "SELECT * FROM wallet_transactions WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+        (user_id, limit)).fetchall()
+
+
+def get_all_wallet_transactions(limit=100):
+    return get_db().execute(
+        "SELECT wt.*, u.username FROM wallet_transactions wt "
+        "JOIN users u ON wt.user_id=u.id ORDER BY wt.created_at DESC LIMIT ?",
+        (limit,)).fetchall()
+
+
+#  Products 
+
+def get_products(approved_only=True, is_auction=None, seller_id=None, category=None,
+                 search=None, sort='latest', min_price=None, max_price=None):
+    sql    = "SELECT * FROM products WHERE 1=1"
+    params = []
+    if approved_only:
+        sql += " AND approved=1"
+    if is_auction is not None:
+        sql += " AND is_auction=?"; params.append(is_auction)
+    if seller_id:
+        sql += " AND seller_id=?"; params.append(seller_id)
+    if category:
+        sql += " AND category=?"; params.append(category)
+    if search:
+        sql += " AND (name LIKE ? OR description LIKE ?)"; params += [f'%{search}%', f'%{search}%']
+    if min_price is not None:
+        sql += " AND price>=?"; params.append(min_price)
+    if max_price is not None:
+        sql += " AND price<=?"; params.append(max_price)
+    order_map = {'latest': 'created_at DESC', 'price_asc': 'price ASC',
+                 'price_desc': 'price DESC', 'popular': 'views DESC',
+                 'highest_bid': 'current_bid DESC'}
+    sql += f" ORDER BY {order_map.get(sort, 'created_at DESC')}"
+    return get_db().execute(sql, params).fetchall()
+
+
+def get_product(pid, approved_only=True):
+    sql = "SELECT * FROM products WHERE id=?"
+    if approved_only:
+        sql += " AND approved=1"
+    return get_db().execute(sql, (pid,)).fetchone()
+
+
+def create_product(name, desc, price, category, image, seller_id, seller_name,
+                   stock, is_auction=0, auction_hours=24, start_price=0):
+    auction_end = None
+    if is_auction:
+        auction_end = (datetime.now() + timedelta(hours=auction_hours)).strftime('%Y-%m-%d %H:%M:%S')
+    db = get_db()
+    db.execute(
+        "INSERT INTO products (name,description,price,category,image,seller_id,seller_name,"
+        "approved,stock,is_auction,auction_end,start_price,current_bid) VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?)",
+        (name, desc, price, category, image, seller_id, seller_name,
+         stock, is_auction, auction_end, start_price, start_price))
+    db.commit()
+
+
+def approve_product(pid, seller_id=None):
+    """Approve a product: set approved=1, status='approved'."""
+    db = get_db()
+    p  = db.execute("SELECT seller_id, name FROM products WHERE id=?", (pid,)).fetchone()
+    if p:
+        db.execute("UPDATE products SET approved=1, status='approved' WHERE id=?", (pid,))
+        db.commit()
+    return p
+
+
+def reject_product(pid):
+    """Reject a product: set approved=0, status='rejected' (soft-reject, keeps row for audit)."""
+    db = get_db()
+    p  = db.execute("SELECT seller_id, name FROM products WHERE id=?", (pid,)).fetchone()
+    if p:
+        db.execute("UPDATE products SET approved=0, status='rejected' WHERE id=?", (pid,))
+        db.commit()
+    return p
+
+
+def deactivate_product(pid):
+    """Deactivate a live product: hide from buyers without deleting."""
+    db = get_db()
+    p  = db.execute("SELECT seller_id, name, approved FROM products WHERE id=?", (pid,)).fetchone()
+    if p:
+        db.execute("UPDATE products SET approved=0, status='inactive' WHERE id=?", (pid,))
+        db.commit()
+    return p
+
+
+def delete_product_admin(pid):
+    """Permanently delete a product (admin use only)."""
+    db = get_db()
+    p  = db.execute("SELECT seller_id, name FROM products WHERE id=?", (pid,)).fetchone()
+    if p:
+        db.execute("DELETE FROM products WHERE id=?", (pid,))
+        db.commit()
+    return p
+
+
+def get_categories():
+    return get_db().execute("SELECT * FROM categories ORDER BY name").fetchall()
+
+
+def get_active_categories(is_auction=0):
+    return get_db().execute(
+        "SELECT DISTINCT category FROM products WHERE approved=1 AND is_auction=? ORDER BY category",
+        (is_auction,)).fetchall()
+
+
+#  Orders 
+
+def get_orders(buyer_id=None, limit=None):
+    sql = "SELECT * FROM orders WHERE 1=1"
+    params = []
+    if buyer_id:
+        sql += " AND buyer_id=?"; params.append(buyer_id)
+    sql += " ORDER BY created_at DESC"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    return get_db().execute(sql, params).fetchall()
+
+
+def get_order(oid, buyer_id=None):
+    sql = "SELECT * FROM orders WHERE id=?"
+    params = [oid]
+    if buyer_id:
+        sql += " AND buyer_id=?"; params.append(buyer_id)
+    return get_db().execute(sql, params).fetchone()
+
+
+def create_order(buyer_id, buyer_name, pid, pname, pimage, amount, quantity,
+                 delivery_fee, discount, total_amount, payment_method,
+                 payment_status, transaction_id, address_id, address_snapshot):
+    db = get_db()
+    db.execute(
+        "INSERT INTO orders (buyer_id,buyer_name,product_id,product_name,product_image,"
+        "amount,quantity,delivery_fee,discount,total_amount,payment_method,"
+        "payment_status,transaction_id,address_id,address_snapshot) VALUES "
+        "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (buyer_id, buyer_name, pid, pname, pimage, amount, quantity,
+         delivery_fee, discount, total_amount, payment_method,
+         payment_status, transaction_id, address_id, address_snapshot))
+    oid = db.execute("SELECT last_insert_rowid() as id").fetchone()['id']
+    db.commit()
+    return oid
+
+
+def update_order_status(oid, status):
+    db = get_db()
+    o  = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if o:
+        db.execute("UPDATE orders SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                   (status, oid))
+        db.commit()
+    return o
+
+
+def cancel_order(oid, buyer_id):
+    db = get_db()
+    o  = db.execute("SELECT * FROM orders WHERE id=? AND buyer_id=?", (oid, buyer_id)).fetchone()
+    if not o or o['status'] not in ('Placed', 'Confirmed'):
+        return False, o
+    db.execute("UPDATE orders SET status='Cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?", (oid,))
+    db.commit()
+    # Auto-refund wallet if payment was made via wallet, card or UPI
+    if o['payment_status'] == 'paid' and o['payment_method'] in ('wallet', 'card', 'upi', 'qr'):
+        refund_amt = float(o['total_amount'] or o['amount'] or 0)
+        if refund_amt > 0:
+            credit_wallet(buyer_id, refund_amt, f'Refund for cancelled order #QD{oid:06d}', 'refund')
+    return True, o
+
+
+def get_seller_orders(seller_id):
+    return get_db().execute(
+        "SELECT o.*, p.name as pname FROM orders o "
+        "JOIN products p ON o.product_id=p.id "
+        "WHERE p.seller_id=? ORDER BY o.created_at DESC",
+        (seller_id,)).fetchall()
+
+
+#  Cart 
+
+def get_cart(buyer_id):
+    return get_db().execute(
+        "SELECT c.id as cid, c.quantity, p.id as pid, p.name, p.price, p.image, p.category "
+        "FROM cart c JOIN products p ON c.product_id=p.id WHERE c.buyer_id=?",
+        (buyer_id,)).fetchall()
+
+
+def cart_item_count(buyer_id):
+    r = get_db().execute(
+        "SELECT SUM(quantity) as t FROM cart WHERE buyer_id=?", (buyer_id,)).fetchone()
+    return r['t'] or 0
+
+
+def add_to_cart(buyer_id, pid):
+    db = get_db()
+    ex = db.execute("SELECT id FROM cart WHERE buyer_id=? AND product_id=?",
+                    (buyer_id, pid)).fetchone()
+    if ex:
+        db.execute("UPDATE cart SET quantity=quantity+1 WHERE id=?", (ex['id'],))
+    else:
+        db.execute("INSERT INTO cart (buyer_id,product_id) VALUES (?,?)", (buyer_id, pid))
+    db.commit()
+
+
+def remove_from_cart(cid, buyer_id):
+    db = get_db()
+    db.execute("DELETE FROM cart WHERE id=? AND buyer_id=?", (cid, buyer_id))
+    db.commit()
+
+
+def clear_cart(buyer_id):
+    db = get_db()
+    db.execute("DELETE FROM cart WHERE buyer_id=?", (buyer_id,))
+    db.commit()
+
+
+#  Addresses 
+
+def get_addresses(user_id):
+    return get_db().execute(
+        "SELECT * FROM addresses WHERE user_id=? ORDER BY is_default DESC, id DESC",
+        (user_id,)).fetchall()
+
+
+def get_address(aid, user_id):
+    return get_db().execute(
+        "SELECT * FROM addresses WHERE id=? AND user_id=?", (aid, user_id)).fetchone()
+
+
+def create_address(user_id, full_name, phone, city, state, pincode, landmark, full_address):
+    db = get_db()
+    is_default = 1 if not db.execute(
+        "SELECT id FROM addresses WHERE user_id=?", (user_id,)).fetchone() else 0
+    db.execute(
+        "INSERT INTO addresses (user_id,full_name,phone,city,state,pincode,landmark,full_address,is_default) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (user_id, full_name, phone, city, state, pincode, landmark, full_address, is_default))
+    db.commit()
+
+
+def delete_address(aid, user_id):
+    db = get_db()
+    db.execute("DELETE FROM addresses WHERE id=? AND user_id=?", (aid, user_id))
+    db.commit()
+
+
+def set_default_address(aid, user_id):
+    db = get_db()
+    db.execute("UPDATE addresses SET is_default=0 WHERE user_id=?", (user_id,))
+    db.execute("UPDATE addresses SET is_default=1 WHERE id=? AND user_id=?", (aid, user_id))
+    db.commit()
+
+
+#  Wishlist 
+
+def get_wishlist_ids(buyer_id):
+    rows = get_db().execute(
+        "SELECT product_id FROM wishlist WHERE buyer_id=?", (buyer_id,)).fetchall()
+    return [r['product_id'] for r in rows]
+
+
+def toggle_wishlist(buyer_id, pid):
+    db = get_db()
+    ex = db.execute("SELECT id FROM wishlist WHERE buyer_id=? AND product_id=?",
+                    (buyer_id, pid)).fetchone()
+    if ex:
+        db.execute("DELETE FROM wishlist WHERE buyer_id=? AND product_id=?", (buyer_id, pid))
+        db.commit()
+        return False
+    else:
+        try:
+            db.execute("INSERT INTO wishlist (buyer_id,product_id) VALUES (?,?)", (buyer_id, pid))
+            db.commit()
+        except Exception:
+            pass
+        return True
+
+
+def get_wishlist_products(buyer_id):
+    return get_db().execute(
+        "SELECT p.* FROM wishlist w JOIN products p ON w.product_id=p.id WHERE w.buyer_id=?",
+        (buyer_id,)).fetchall()
+
+
+#  Bids 
+
+def get_bids(product_id, limit=20):
+    return get_db().execute(
+        "SELECT * FROM bids WHERE product_id=? ORDER BY amount DESC LIMIT ?",
+        (product_id, limit)).fetchall()
+
+
+def get_leaderboard(product_id, limit=5):
+    return get_db().execute(
+        "SELECT username, MAX(amount) as top FROM bids WHERE product_id=? "
+        "GROUP BY username ORDER BY top DESC LIMIT ?",
+        (product_id, limit)).fetchall()
+
+
+def place_bid(product_id, user_id, username, amount, ip_address):
+    """
+    Place a bid. No wallet balance check — any user can bid any amount.
+    Payment is collected after auction ends from the highest bidder.
+    """
+    db = get_db()
+    prev = db.execute(
+        "SELECT highest_bidder, highest_bid_uid, bid_count FROM products WHERE id=?",
+        (product_id,)).fetchone()
+    db.execute(
+        "INSERT INTO bids (product_id,user_id,username,amount,ip_address) VALUES (?,?,?,?,?)",
+        (product_id, user_id, username, amount, ip_address))
+    db.execute(
+        "UPDATE products SET current_bid=?,bid_count=bid_count+1,highest_bidder=?,highest_bid_uid=? WHERE id=?",
+        (amount, username, user_id, product_id))
+    db.commit()
+    return prev
+
+
+#  Notifications 
+
+def add_notification(user_id, message, ntype='info'):
+    db = get_db()
+    db.execute("INSERT INTO notifications (user_id,message,ntype) VALUES (?,?,?)",
+               (user_id, message, ntype))
+    db.commit()
+
+
+def get_notifications(user_id, unread_only=False, limit=30):
+    sql = "SELECT * FROM notifications WHERE user_id=?"
+    params = [user_id]
+    if unread_only:
+        sql += " AND read=0"
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    return get_db().execute(sql, params).fetchall()
+
+
+def mark_notifications_read(user_id):
+    db = get_db()
+    db.execute("UPDATE notifications SET read=1 WHERE user_id=?", (user_id,))
+    db.commit()
+
+
+def unread_count(user_id):
+    r = get_db().execute(
+        "SELECT COUNT(*) as n FROM notifications WHERE user_id=? AND read=0",
+        (user_id,)).fetchone()
+    return r['n'] or 0
+
+
+#  Messages 
+
+def get_conversations(user_id):
+    return get_db().execute(
+        "SELECT DISTINCT m.auction_id, p.name as product_name, "
+        "CASE WHEN m.sender_id=? THEN m.receiver_id ELSE m.sender_id END as other_id, "
+        "u.username as other_name, m.created_at "
+        "FROM messages m "
+        "JOIN products p ON m.auction_id=p.id "
+        "JOIN users u ON u.id=(CASE WHEN m.sender_id=? THEN m.receiver_id ELSE m.sender_id END) "
+        "WHERE m.sender_id=? OR m.receiver_id=? "
+        "ORDER BY m.created_at DESC",
+        (user_id, user_id, user_id, user_id)).fetchall()
+
+
+def get_message_thread(auction_id, user_id, other_id):
+    return get_db().execute(
+        "SELECT m.*, u.username FROM messages m JOIN users u ON m.sender_id=u.id "
+        "WHERE m.auction_id=? AND "
+        "(m.sender_id=? AND m.receiver_id=? OR m.sender_id=? AND m.receiver_id=?) "
+        "ORDER BY m.created_at ASC",
+        (auction_id, user_id, other_id, other_id, user_id)).fetchall()
+
+
+def send_message(auction_id, sender_id, receiver_id, message):
+    db = get_db()
+    db.execute(
+        "INSERT INTO messages (auction_id,sender_id,receiver_id,message) VALUES (?,?,?,?)",
+        (auction_id, sender_id, receiver_id, message))
+    db.commit()
+
+
+def mark_messages_read(auction_id, receiver_id):
+    db = get_db()
+    db.execute("UPDATE messages SET read=1 WHERE auction_id=? AND receiver_id=?",
+               (auction_id, receiver_id))
+    db.commit()
+
+
+#  Auction tokens / anti-bot 
+
+def issue_auction_token(user_id, product_id):
+    token = secrets.token_hex(16)
+    db = get_db()
+    db.execute(
+        '''INSERT INTO auction_tokens (user_id,product_id,token)
+           VALUES (?,?,?)
+           ON CONFLICT(user_id,product_id)
+           DO UPDATE SET token=excluded.token, issued_at=CURRENT_TIMESTAMP, interacted=0''',
+        (user_id, product_id, token))
+    db.commit()
+    return token
+
+
+def mark_interaction(user_id, product_id):
+    db = get_db()
+    db.execute("UPDATE auction_tokens SET interacted=1 WHERE user_id=? AND product_id=?",
+               (user_id, product_id))
+    db.commit()
+
+
+def validate_auction_token(user_id, product_id, token, page_dwell=3):
+    db  = get_db()
+    row = db.execute(
+        "SELECT * FROM auction_tokens WHERE user_id=? AND product_id=?",
+        (user_id, product_id)).fetchone()
+    if not row or row['token'] != token:
+        return False, 'Invalid session token. Reload the page.'
+    issued = datetime.strptime(str(row['issued_at'])[:19], '%Y-%m-%d %H:%M:%S')
+    if (datetime.now() - issued).total_seconds() < page_dwell:
+        return False, f'Please wait {page_dwell}s before bidding.'
+    if not row['interacted']:
+        return False, 'Please scroll or click on the page first.'
+    return True, 'OK'
+
+
+def log_bid_rate(user_id, product_id, ip):
+    db = get_db()
+    db.execute("INSERT INTO bid_rate_log (user_id,product_id,ip_address) VALUES (?,?,?)",
+               (user_id, product_id, ip))
+    db.commit()
+
+
+def check_bid_rate(user_id, product_id, ip, cooldown=5, window=10, max_bids=3, block_min=15):
+    db = get_db()
+    if db.execute(
+        "SELECT id FROM blocked_ips WHERE ip_address=? AND "
+        "(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)", (ip,)).fetchone():
+        return False, 'Your IP is temporarily blocked.'
+    now          = datetime.now()
+    cooldown_cut = (now - timedelta(seconds=cooldown)).strftime('%Y-%m-%d %H:%M:%S')
+    window_cut   = (now - timedelta(seconds=window)).strftime('%Y-%m-%d %H:%M:%S')
+    if db.execute(
+        "SELECT id FROM bid_rate_log WHERE user_id=? AND product_id=? AND created_at>? LIMIT 1",
+        (user_id, product_id, cooldown_cut)).fetchone():
+        return False, f'Wait {cooldown}s between bids.'
+    n = db.execute(
+        "SELECT COUNT(*) as n FROM bid_rate_log WHERE user_id=? AND created_at>?",
+        (user_id, window_cut)).fetchone()['n']
+    if n >= max_bids:
+        exp = (now + timedelta(minutes=block_min)).strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            db.execute("INSERT OR REPLACE INTO blocked_ips (ip_address,reason,expires_at) VALUES (?,?,?)",
+                       (ip, 'Automated bidding detected', exp))
+            db.commit()
+        except Exception:
+            pass
+        return False, 'Suspicious activity. Temporarily blocked.'
+    return True, 'OK'
+
+
+#  Security 
+
+def log_security(user_id, ip, action, detail=''):
+    db = get_db()
+    db.execute("INSERT INTO security_log (user_id,ip_address,action,detail) VALUES (?,?,?,?)",
+               (user_id, ip, action, detail))
+    db.commit()
+
+
+def get_security_logs(limit=20):
+    return get_db().execute(
+        "SELECT * FROM security_log ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+
+
+def get_blocked_ips():
+    return get_db().execute(
+        "SELECT * FROM blocked_ips WHERE expires_at>CURRENT_TIMESTAMP OR expires_at IS NULL"
+    ).fetchall()
+
+
+def unblock_ip(ip):
+    db = get_db()
+    db.execute("DELETE FROM blocked_ips WHERE ip_address=?", (ip,))
+    db.commit()
+
+
+#  QR Settings 
+
+def get_qr_settings():
+    return get_db().execute("SELECT * FROM qr_settings WHERE id=1").fetchone()
+
+
+def update_qr_settings(qr_image, upi_id):
+    db = get_db()
+    db.execute("UPDATE qr_settings SET qr_image=?,upi_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=1",
+               (qr_image, upi_id))
+    db.commit()
+
+
+#  Admin Stats (see get_admin_stats at bottom of file)
+
+
+#  Chat 
+
+def get_chat_messages(product_id, limit=30):
+    return get_db().execute(
+        "SELECT * FROM chat_messages WHERE product_id=? ORDER BY created_at DESC LIMIT ?",
+        (product_id, limit)).fetchall()
+
+
+def save_chat_message(product_id, user_id, username, message):
+    conn = get_raw_conn()
+    conn.execute(
+        "INSERT INTO chat_messages (product_id,user_id,username,message) VALUES (?,?,?,?)",
+        (product_id, user_id, username, message))
+    conn.commit()
+    conn.close()
+
+
+#  Watchers 
+
+def toggle_watcher(user_id, product_id):
+    db = get_db()
+    ex = db.execute("SELECT id FROM watchers WHERE user_id=? AND product_id=?",
+                    (user_id, product_id)).fetchone()
+    if ex:
+        db.execute("DELETE FROM watchers WHERE user_id=? AND product_id=?", (user_id, product_id))
+        db.execute("UPDATE products SET watcher_count=MAX(0,watcher_count-1) WHERE id=?", (product_id,))
+        db.commit()
+        return False
+    try:
+        db.execute("INSERT INTO watchers (user_id,product_id) VALUES (?,?)", (user_id, product_id))
+        db.execute("UPDATE products SET watcher_count=watcher_count+1 WHERE id=?", (product_id,))
+        db.commit()
+    except Exception:
+        pass
+    return True
+
+
+#  Promo Codes 
+
+def get_promo_code(code):
+    return get_db().execute(
+        "SELECT * FROM promo_codes WHERE code=? AND is_active=1", (code,)).fetchone()
+
+
+def apply_promo(code, subtotal):
+    """Returns (discount_amount, promo_row, error_message)."""
+    promo = get_promo_code(code.strip().upper())
+    if not promo:
+        return 0.0, None, "Invalid or inactive promo code."
+    if subtotal < promo['min_order']:
+        return 0.0, None, f"Minimum order Rs.{promo['min_order']:.0f} required for this code."
+    if promo['max_uses'] and promo['used_count'] >= promo['max_uses']:
+        return 0.0, None, "This promo code has reached its usage limit."
+    if promo['discount_type'] == 'percentage':
+        discount = round(subtotal * promo['value'] / 100, 2)
+    else:
+        discount = min(promo['value'], subtotal)
+    return discount, promo, None
+
+
+def use_promo_code(code):
+    db = get_db()
+    db.execute("UPDATE promo_codes SET used_count=used_count+1 WHERE code=?", (code,))
+    db.commit()
+
+
+def get_all_promo_codes():
+    return get_db().execute("SELECT * FROM promo_codes ORDER BY created_at DESC").fetchall()
+
+
+def create_promo_code(code, discount_type, value, min_order, max_uses=None):
+    db = get_db()
+    db.execute(
+        "INSERT INTO promo_codes (code,discount_type,value,min_order,max_uses,is_active) "
+        "VALUES (?,?,?,?,?,1)",
+        (code.strip().upper(), discount_type, value, min_order, max_uses))
+    db.commit()
+
+
+def toggle_promo_code(pid):
+    db = get_db()
+    db.execute("UPDATE promo_codes SET is_active=NOT is_active WHERE id=?", (pid,))
+    db.commit()
+
+
+def delete_promo_code(pid):
+    db = get_db()
+    db.execute("DELETE FROM promo_codes WHERE id=?", (pid,))
+    db.commit()
+
+
+#  Wallet Requests (approval-based top-up) 
+
+def create_wallet_request(user_id, amount, method, transaction_id='', card_last4=''):
+    db = get_db()
+    db.execute(
+        "INSERT INTO wallet_requests (user_id,amount,method,transaction_id,card_last4,status) "
+        "VALUES (?,?,?,?,?,'pending')",
+        (user_id, amount, method, transaction_id, card_last4))
+    db.commit()
+
+
+def get_wallet_requests(user_id=None, status=None, limit=50):
+    sql = ("SELECT wr.*, u.username FROM wallet_requests wr "
+           "JOIN users u ON wr.user_id=u.id WHERE 1=1")
+    params = []
+    if user_id:
+        sql += " AND wr.user_id=?"; params.append(user_id)
+    if status:
+        sql += " AND wr.status=?"; params.append(status)
+    sql += f" ORDER BY wr.created_at DESC LIMIT {int(limit)}"
+    return get_db().execute(sql, params).fetchall()
+
+
+def approve_wallet_request(req_id, admin_id, note=''):
+    db  = get_db()
+    req = db.execute("SELECT * FROM wallet_requests WHERE id=? AND status='pending'",
+                     (req_id,)).fetchone()
+    if not req:
+        return False, "Request not found or already reviewed."
+    credit_wallet(req['user_id'], req['amount'],
+                  f"Wallet top-up approved (Req #{req_id})", method=req['method'])
+    db.execute(
+        "UPDATE wallet_requests SET status='approved',admin_note=?,reviewed_by=?,"
+        "reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+        (note, admin_id, req_id))
+    db.commit()
+    add_notification(req['user_id'],
+                     f"Rs.{req['amount']:.2f} wallet top-up approved and added to your wallet!",
+                     ntype='info')
+    return True, "Approved."
+
+
+def reject_wallet_request(req_id, admin_id, note=''):
+    db  = get_db()
+    req = db.execute("SELECT * FROM wallet_requests WHERE id=? AND status='pending'",
+                     (req_id,)).fetchone()
+    if not req:
+        return False, "Request not found or already reviewed."
+    db.execute(
+        "UPDATE wallet_requests SET status='rejected',admin_note=?,reviewed_by=?,"
+        "reviewed_at=CURRENT_TIMESTAMP WHERE id=?",
+        (note, admin_id, req_id))
+    db.commit()
+    add_notification(req['user_id'],
+                     f"Your wallet top-up request of Rs.{req['amount']:.2f} was rejected."
+                     + (f" Reason: {note}" if note else ""),
+                     ntype='info')
+    return True, "Rejected."
+
+
+#  Contact Messages 
+
+def create_contact_message(name, email, subject, message):
+    db = get_db()
+    db.execute(
+        "INSERT INTO contact_messages (name,email,subject,message) VALUES (?,?,?,?)",
+        (name, email, subject, message))
+    db.commit()
+
+
+def get_contact_messages(resolved=None, limit=100):
+    sql = "SELECT * FROM contact_messages WHERE 1=1"
+    params = []
+    if resolved is not None:
+        sql += " AND is_resolved=?"; params.append(1 if resolved else 0)
+    sql += f" ORDER BY created_at DESC LIMIT {int(limit)}"
+    return get_db().execute(sql, params).fetchall()
+
+
+def resolve_contact_message(mid):
+    db = get_db()
+    db.execute("UPDATE contact_messages SET is_resolved=1 WHERE id=?", (mid,))
+    db.commit()
+
+
+#  Image upload helper 
+
+import uuid
+from werkzeug.utils import secure_filename
+
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+
+
+def allowed_image(filename):
+    return ('.' in filename and
+            filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS)
+
+
+def save_uploaded_image(file_obj, subfolder='products'):
+    """Save a Werkzeug FileStorage to static/uploads/<subfolder>/. Returns URL path."""
+    if not file_obj or not file_obj.filename:
+        return ''
+    if not allowed_image(file_obj.filename):
+        return ''
+    ext      = secure_filename(file_obj.filename).rsplit('.', 1)[-1].lower()
+    fname    = f"{uuid.uuid4().hex}.{ext}"
+    dest_dir = os.path.join(BASE_DIR, 'static', 'uploads', subfolder)
+    os.makedirs(dest_dir, exist_ok=True)
+    file_obj.save(os.path.join(dest_dir, fname))
+    return f"/static/uploads/{subfolder}/{fname}"
+
+
+#  Auction Winners & Failover Logic 
+
+AUCTION_PAYMENT_HOURS = 24  # hours the winner has to pay before failover kicks in
+
+
+def get_ranked_bidders(product_id):
+    """Return ordered list of unique bidders with their highest bid amount."""
+    return get_db().execute(
+        "SELECT user_id, username, MAX(amount) as top_bid "
+        "FROM bids WHERE product_id=? "
+        "GROUP BY user_id ORDER BY top_bid DESC",
+        (product_id,)).fetchall()
+
+
+def settle_auction(product_id):
+    """
+    Called when an auction ends. Creates winner records for all bidders
+    ranked by their highest bid. Winner rank 1 gets payment deadline;
+    others are fallback candidates.
+    """
+    db = get_db()
+    # Avoid re-settling
+    existing = db.execute(
+        "SELECT id FROM auction_winners WHERE product_id=? AND rank=1",
+        (product_id,)).fetchone()
+    if existing:
+        return  # already settled
+
+    ranked = get_ranked_bidders(product_id)
+    if not ranked:
+        return  # no bids
+
+    deadline = (datetime.now() + timedelta(hours=AUCTION_PAYMENT_HOURS)).strftime('%Y-%m-%d %H:%M:%S')
+
+    for i, row in enumerate(ranked, start=1):
+        status = 'pending_payment' if i == 1 else 'skipped'
+        pay_dl = deadline if i == 1 else None
+        db.execute(
+            "INSERT OR IGNORE INTO auction_winners "
+            "(product_id, winner_user_id, winner_username, bid_amount, rank, status, payment_deadline) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (product_id, row['user_id'], row['username'], row['top_bid'], i, status, pay_dl))
+
+    db.commit()
+
+    # Notify rank-1 winner
+    top = ranked[0]
+    add_notification(
+        top['user_id'],
+        f"Congratulations! You won the auction. Please pay Rs.{top['top_bid']:.2f} within {AUCTION_PAYMENT_HOURS} hours.",
+        ntype='info')
+
+
+def get_current_winner(product_id):
+    """Get the current active winner (pending_payment or paid) for an auction."""
+    return get_db().execute(
+        "SELECT aw.*, u.email FROM auction_winners aw "
+        "JOIN users u ON aw.winner_user_id=u.id "
+        "WHERE aw.product_id=? AND aw.status IN ('pending_payment','paid') "
+        "ORDER BY aw.rank ASC LIMIT 1",
+        (product_id,)).fetchone()
+
+
+def get_auction_leaderboard(product_id):
+    """Full leaderboard including payment status for ended auctions."""
+    return get_db().execute(
+        "SELECT aw.rank, aw.winner_username, aw.bid_amount, aw.status, aw.payment_deadline "
+        "FROM auction_winners aw WHERE aw.product_id=? ORDER BY aw.rank ASC",
+        (product_id,)).fetchall()
+
+
+def process_auction_payment(product_id, user_id):
+    """
+    Called when a winner pays. Deducts wallet, marks as paid.
+    Returns (success, message).
+    """
+    db  = get_db()
+    win = db.execute(
+        "SELECT * FROM auction_winners WHERE product_id=? AND winner_user_id=? AND status='pending_payment'",
+        (product_id, user_id)).fetchone()
+    if not win:
+        return False, "No pending payment found for you on this auction."
+
+    balance = get_wallet(user_id)
+    if balance < win['bid_amount']:
+        return False, f"Insufficient wallet balance (Rs.{balance:.2f}). Please top up first."
+
+    # Deduct from wallet
+    deduct_wallet(user_id, win['bid_amount'],
+                  f"Auction payment for product #{product_id}",
+                  method='auction')
+
+    # Mark as paid
+    db.execute(
+        "UPDATE auction_winners SET status='paid', paid_at=CURRENT_TIMESTAMP WHERE id=?",
+        (win['id'],))
+    db.commit()
+
+    add_notification(user_id,
+                     f"Payment of Rs.{win['bid_amount']:.2f} confirmed. Auction item will be delivered soon.",
+                     ntype='info')
+    return True, "Payment successful!"
+
+
+def trigger_failover(product_id):
+    """
+    If the current rank-1 winner fails to pay within the deadline,
+    move them to 'failed' and promote the next bidder.
+    Returns the new winner row or None if no more candidates.
+    """
+    db  = get_db()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    # Find expired unpaid winner
+    expired = db.execute(
+        "SELECT * FROM auction_winners WHERE product_id=? AND status='pending_payment' "
+        "AND payment_deadline < ?",
+        (product_id, now)).fetchone()
+    if not expired:
+        return None  # no expired winner
+
+    # Mark as failed
+    db.execute("UPDATE auction_winners SET status='failed' WHERE id=?", (expired['id'],))
+
+    # Find next candidate (lowest rank that is still 'skipped')
+    next_w = db.execute(
+        "SELECT * FROM auction_winners WHERE product_id=? AND status='skipped' "
+        "ORDER BY rank ASC LIMIT 1",
+        (product_id,)).fetchone()
+
+    if not next_w:
+        db.commit()
+        return None  # no more candidates
+
+    # Assign payment deadline to next winner
+    new_deadline = (datetime.now() + timedelta(hours=AUCTION_PAYMENT_HOURS)).strftime('%Y-%m-%d %H:%M:%S')
+    db.execute(
+        "UPDATE auction_winners SET status='pending_payment', payment_deadline=? WHERE id=?",
+        (new_deadline, next_w['id']))
+    db.commit()
+
+    add_notification(
+        next_w['winner_user_id'],
+        f"You are now the winner of the auction! Please pay Rs.{next_w['bid_amount']:.2f} within {AUCTION_PAYMENT_HOURS} hours.",
+        ntype='info')
+
+    return next_w
+
+
+def get_user_auction_win(product_id, user_id):
+    """Check if user has a pending payment or won status for this auction."""
+    return get_db().execute(
+        "SELECT * FROM auction_winners WHERE product_id=? AND winner_user_id=? AND status='pending_payment'",
+        (product_id, user_id)).fetchone()
+
+
+def get_admin_stats():
+    """Extended stats including active auctions."""
+    db = get_db()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return {
+        'total_users':      db.execute("SELECT COUNT(*) as n FROM users").fetchone()['n'],
+        'total_products':   db.execute("SELECT COUNT(*) as n FROM products").fetchone()['n'],
+        'total_orders':     db.execute("SELECT COUNT(*) as n FROM orders").fetchone()['n'],
+        'total_bids':       db.execute("SELECT COUNT(*) as n FROM bids").fetchone()['n'],
+        'active_auctions':  db.execute(
+            "SELECT COUNT(*) as n FROM products WHERE is_auction=1 AND approved=1 AND auction_end>?",
+            (now,)).fetchone()['n'],
+        'total_rev':        db.execute("SELECT SUM(total_amount) as s FROM orders").fetchone()['s'] or 0,
+        'pending_products': db.execute("SELECT COUNT(*) as n FROM products WHERE approved=0 AND status='pending'").fetchone()['n'],
+        'total_wallet':     db.execute("SELECT SUM(wallet) as s FROM users").fetchone()['s'] or 0,
+    }

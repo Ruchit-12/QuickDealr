@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}QuickDealr — Shop & Bid Live{% endblock %}
+{% block content %}
+
+<section class="hero">
+  <div class="hero-inner">
+    <div class="hero-text">
+      <div class="hero-greeting">Welcome, <strong>{{ session.get('username') }}</strong></div>
+      <h1>Shop Smart.<br><em>Bid Live.</em><br>Win Big.</h1>
+      <p>Browse real products. Join live auctions. Get the best deals — all in one place.</p>
+      <div class="hero-actions">
+        <a href="{{ url_for('buyer.auctions_list') }}" class="btn-hero-primary">⚡ Enter Live Auctions</a>
+        <a href="#products" class="btn-hero-ghost">Shop Now →</a>
+      </div>
+      <div class="hero-trust">
+        <span>🔒 Secure Payments</span>
+        <span>⚡ Real-time Bidding</span>
+        <span>📦 Fast Delivery</span>
+      </div>
+    </div>
+    <div class="hero-visual-simple">
+      <div class="hero-stats-panel">
+        <div class="hstat-grid">
+          <div class="hstat">
+            <div class="hstat-icon">🛍️</div>
+            <span>{{ recent|length }}</span>
+            <label>Products</label>
+          </div>
+          <div class="hstat">
+            <div class="hstat-icon">🔴</div>
+            <span id="liveCount">—</span>
+            <label>Live Now</label>
+          </div>
+          <div class="hstat">
+            <div class="hstat-icon">💰</div>
+            <span>&#8377;{{ "{:,.0f}".format(get_wallet(session.get('user_id'))) }}</span>
+            <label>Wallet</label>
+          </div>
+          <div class="hstat">
+            <div class="hstat-icon">🏆</div>
+            <span id="heroWinCount">0</span>
+            <label>Wins</label>
+          </div>
+        </div>
+        <a href="{{ url_for('buyer.auctions_list') }}" class="hero-live-pill">
+          <span class="live-dot2"></span>
+          LIVE AUCTIONS RUNNING NOW
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- AUCTION BANNER -->
+<section class="auction-banner-section">
+  <div class="container">
+    <a href="{{ url_for('buyer.auctions_list') }}" class="auction-banner-card">
+      <div class="auction-banner-glow"></div>
+      <div class="auction-banner-content">
+        <div class="auction-live-dot"></div>
+        <div>
+          {% set auction_count = all_products|selectattr('is_auction','equalto',1)|list|length if all_products else 0 %}
+          <h2>{% if auction_count > 0 %}{{ auction_count }} Active Auction{% if auction_count != 1 %}s{% endif %} — Live Now{% else %}0 Active Auctions{% endif %}</h2>
+          <p>Bid on exclusive items. Highest bidder wins. Real-time updates.</p>
+        </div>
+        <span class="auction-banner-cta">Enter Auctions →</span>
+      </div>
+    </a>
+  </div>
+</section>
+
+<!-- CATEGORY FILTER -->
+<div class="cat-bar">
+  <div class="container cat-bar-inner">
+    <a href="{{ url_for('buyer.home') }}" class="cat-pill {% if not active_cat %}active{% endif %}">All</a>
+    {% for c in active_cats %}
+      <a href="{{ url_for('buyer.home', category=c['category']) }}" class="cat-pill {% if active_cat==c['category'] %}active{% endif %}">{{ c['category'] }}</a>
+    {% endfor %}
+    {% if not active_cats %}<span class="cat-pill-empty">No products listed yet</span>{% endif %}
+  </div>
+</div>
+
+{% if search_q or active_cat or min_p or max_p %}
+<section class="section-block">
+  <div class="container">
+    <div class="filter-bar">
+      <form method="GET" action="{{ url_for('buyer.home') }}" class="filter-form">
+        <input type="hidden" name="q" value="{{ search_q }}">
+        <input type="hidden" name="category" value="{{ active_cat }}">
+        <div class="filter-group"><label>Min &#8377;</label><input type="number" name="min_price" value="{{ min_p }}" placeholder="0"></div>
+        <div class="filter-group"><label>Max &#8377;</label><input type="number" name="max_price" value="{{ max_p }}" placeholder="Any"></div>
+        <div class="filter-group"><label>Sort</label>
+          <select name="sort">
+            <option value="latest" {% if sort=='latest' %}selected{% endif %}>Latest</option>
+            <option value="price_asc" {% if sort=='price_asc' %}selected{% endif %}>Price ↑</option>
+            <option value="price_desc" {% if sort=='price_desc' %}selected{% endif %}>Price ↓</option>
+            <option value="popular" {% if sort=='popular' %}selected{% endif %}>Popular</option>
+          </select>
+        </div>
+        <button type="submit" class="btn-filter">Apply</button>
+        <a href="{{ url_for('buyer.home') }}" class="btn-filter-clear">Clear</a>
+      </form>
+    </div>
+    <div class="results-header">
+      <h2>{% if search_q %}"{{ search_q }}"{% elif active_cat %}{{ active_cat }}{% else %}Results{% endif %} <span class="results-count">{{ all_products|length }} found</span></h2>
+    </div>
+    {% if all_products %}
+    <div class="products-grid">
+      {% for p in all_products %}{% include 'buyer/_product_card.html' %}{% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state"><span></span><h3>No results found</h3><p>Try different keywords</p><a href="{{ url_for('buyer.home') }}" class="btn-primary">Back to Home</a></div>
+    {% endif %}
+  </div>
+</section>
+{% else %}
+
+<!-- RECENT PRODUCTS -->
+<section class="section-block" id="products">
+  <div class="container">
+    <div class="section-hdr">
+      <h2> New Arrivals</h2>
+      <a href="{{ url_for('buyer.home', sort='latest') }}" class="see-all">See all →</a>
+    </div>
+    {% if recent %}
+    <div class="products-grid">
+      {% for p in recent %}{% include 'buyer/_product_card.html' %}{% endfor %}
+    </div>
+    {% else %}
+    <div class="empty-state"><span></span><h3>No products yet</h3><p>Products listed by sellers will appear here once approved.</p></div>
+    {% endif %}
+  </div>
+</section>
+{% endif %}
+
+{% endblock %}
